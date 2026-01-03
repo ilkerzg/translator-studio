@@ -31,7 +31,7 @@ export const metadata: Metadata = {
     description: "Complete AI translation toolkit: transcription, text translation, speech-to-speech, video dubbing with lip sync, voice cloning, and auto subtitles.",
     images: [
       {
-        url: `${baseUrl}/api/og`,
+        url: `${baseUrl}/og-image.png`,
         width: 1200,
         height: 630,
         alt: "fal.ai Translator Studio - AI-Powered Translation Suite",
@@ -42,7 +42,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Translator Studio | fal.ai",
     description: "AI-powered translation suite: transcription, dubbing, subtitles, voice cloning & more.",
-    images: [`${baseUrl}/api/og`],
+    images: [`${baseUrl}/og-image.png`],
     creator: "@faboratory",
   },
   metadataBase: new URL(baseUrl),
