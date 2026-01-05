@@ -17,7 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Upload, X, Download, Volume2, AlertCircle, CheckCircle2, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES, MODELS, getLanguageByCode } from "@/lib/constants";
-import { extractAudioFromVideo, replaceVideoAudio } from "@/lib/audio-utils";
+import { extractAudioFromVideo, mergeAudioSegmentsAtTimestamps, type AudioSegment } from "@/lib/audio-utils";
 import { CustomVideoPlayer } from "./CustomVideoPlayer";
 import type { ProcessingStatus } from "@/lib/types";
 
@@ -135,29 +135,118 @@ export function VideoVoiceDub({ hasFalKey }: VideoVoiceDubProps) {
       if (!clonedVoiceId) throw new Error("Failed to clone voice");
       updateStep("clone", "complete");
 
-      // Step 4: Transcribe with Whisper (accepts video directly)
+      // Step 4: Transcribe with ElevenLabs STT (word-level timestamps)
       updateStep("transcribe", "processing");
-      setProgress("Transcribing audio...");
+      setProgress("Transcribing audio with word timestamps...");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const sttInput: any = {
-        audio_url: videoUrl,
-        task: "transcribe",
-        chunk_level: "segment",
-        version: "3",
-      };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const sttResult = (await fal.subscribe(MODELS.whisper, {
-        input: sttInput,
+      const sttResult = (await fal.subscribe(MODELS.elevenlabsSTT, {
+        input: {
+          audio_url: videoUrl,
+          tag_audio_events: true,
+          diarize: true,
+        },
+        logs: true,
       })) as any;
       const sttData = sttResult?.data || sttResult;
       const transcriptText = sttData?.text || "";
+      const words = sttData?.words || [];
       if (!transcriptText) throw new Error("Failed to transcribe audio - no speech detected");
       setTranscript(transcriptText);
       updateStep("transcribe", "complete");
 
-      // Step 5: Translate with structured output for TTS optimization
+      // Build word list with timestamps for AI segmentation
+      interface WordData {
+        text: string;
+        start: number;
+        end: number;
+        type: string;
+        speaker_id?: string;
+      }
+      interface TextSegment {
+        text: string;
+        startTime: number;
+        endTime: number;
+      }
+
+      const wordList = (words as WordData[])
+        .filter(w => w.type === "word")
+        .map((w, idx) => ({ idx, text: w.text, start: w.start, end: w.end }));
+
+      if (wordList.length === 0) throw new Error("No words found in transcript");
+
+      // Use AI to intelligently segment the transcript
+      setProgress("AI segmenting transcript...");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const segmentResult = (await fal.subscribe(MODELS.llm, {
+        input: {
+          prompt: `You are an expert at segmenting speech for video dubbing. Analyze this transcript and split it into natural segments.
+
+RULES:
+1. NEVER split in the middle of a sentence or phrase
+2. Each segment should be a complete thought (1-3 sentences max)
+3. Keep segments SHORT - ideally 2-8 words each for dubbing
+4. Consider natural speech pauses and meaning
+5. Names, numbers, and lists can be their own segments
+6. Maximum segment duration: 5 seconds
+
+TRANSCRIPT WITH WORD TIMESTAMPS:
+${wordList.map(w => `[${w.idx}] "${w.text}" (${w.start.toFixed(2)}s-${w.end.toFixed(2)}s)`).join('\n')}
+
+Return JSON array of segments. Each segment has start_idx and end_idx (inclusive word indices):
+[
+  {"start_idx": 0, "end_idx": 3},
+  {"start_idx": 4, "end_idx": 8},
+  ...
+]
+
+Only return valid JSON array, nothing else.`,
+          system_prompt: "Expert speech segmentation AI. Return only valid JSON array. Focus on natural sentence boundaries and meaning. Never cut mid-sentence.",
+          model: MODELS.llmModel,
+          temperature: 0.1,
+        },
+      })) as any;
+
+      const segmentData = segmentResult?.data || segmentResult;
+      const rawSegments = (segmentData?.output || segmentData?.text || "").trim();
+
+      let aiSegments: { start_idx: number; end_idx: number }[] = [];
+      try {
+        aiSegments = JSON.parse(rawSegments.replace(/```json\n?|\n?```/g, ""));
+      } catch {
+        console.error("Failed to parse AI segments, falling back to simple split");
+        // Fallback: one segment per ~5 words
+        for (let i = 0; i < wordList.length; i += 5) {
+          aiSegments.push({ start_idx: i, end_idx: Math.min(i + 4, wordList.length - 1) });
+        }
+      }
+
+      // Convert AI segments to TextSegments with timestamps
+      const textSegments: TextSegment[] = [];
+      for (const seg of aiSegments) {
+        const startWord = wordList[seg.start_idx];
+        const endWord = wordList[seg.end_idx];
+        if (!startWord || !endWord) continue;
+
+        const segmentWords = wordList.slice(seg.start_idx, seg.end_idx + 1);
+        textSegments.push({
+          text: segmentWords.map(w => w.text).join(" "),
+          startTime: startWord.start,
+          endTime: endWord.end,
+        });
+      }
+
+      if (textSegments.length === 0) throw new Error("No speech segments found");
+
+      // Debug: Log AI-detected segments
+      console.log(`[VideoVoiceDub] AI detected ${textSegments.length} speech segments:`);
+      textSegments.forEach((seg, i) => {
+        const duration = seg.endTime - seg.startTime;
+        console.log(`  Segment ${i}: [${seg.startTime.toFixed(2)}s - ${seg.endTime.toFixed(2)}s] (${duration.toFixed(2)}s) "${seg.text}"`);
+      });
+
+      // Step 5: Translate each segment
       updateStep("translate", "processing");
-      setProgress("Translating...");
+      setProgress(`Translating ${textSegments.length} segments...`);
       const targetLang = getLanguageByCode(targetLanguage)?.name || targetLanguage;
 
       // Build context section if provided
@@ -166,88 +255,164 @@ export function VideoVoiceDub({ hasFalKey }: VideoVoiceDubProps) {
 """${translationContext.trim()}"""\n`
         : "";
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const translateResult = (await fal.subscribe(MODELS.llm, {
-        input: {
-          prompt: `Translate the following text to ${targetLang}.
-${contextSection}
-Return a JSON object with:
-1. "translation": The translated text
-2. "language_boost": The target language name for TTS (e.g., "Turkish", "German", "French", "English")
-3. "pronunciation_hints": Array of pronunciation hints for difficult words, names, or technical terms. Format: ["word/(pronunciation)", ...]. Leave empty array if not needed.
-
-Only return valid JSON, nothing else.
-
-Text to translate:
-"""${transcriptText}"""`,
-          system_prompt:
-            "You are a professional translator. Always return valid JSON format. Pay special attention to any context provided by the user regarding names, terms, or proper nouns.",
-          model: MODELS.llmModel,
-          temperature: 0.3,
-        },
-      })) as any;
-      const translateData = translateResult?.data || translateResult;
-      const rawOutput = (translateData?.output || translateData?.text || "").trim();
-
-      // Parse structured translation response
-      let translated = "";
-      let languageBoost = targetLang;
-      let pronunciationHints: string[] = [];
-
-      try {
-        const parsed = JSON.parse(rawOutput.replace(/```json\n?|\n?```/g, ""));
-        translated = parsed.translation || "";
-        languageBoost = parsed.language_boost || targetLang;
-        pronunciationHints = parsed.pronunciation_hints || [];
-      } catch {
-        // Fallback: treat as plain text
-        translated = rawOutput.replace(/^["']|["']$/g, "");
+      interface TranslatedSegment {
+        originalText: string;
+        translatedText: string;
+        startTime: number;
+        maxDuration: number; // Max allowed duration until next segment
+        languageBoost: string;
       }
 
-      if (!translated) throw new Error("Failed to translate text");
-      setTranslatedText(translated);
+      const translatedSegments: TranslatedSegment[] = [];
+
+      for (let i = 0; i < textSegments.length; i++) {
+        const segment = textSegments[i]!;
+        const nextSegment = textSegments[i + 1];
+
+        // Calculate EXACT available time until next segment
+        const maxDuration = nextSegment
+          ? nextSegment.startTime - segment.startTime
+          : 10; // Last segment gets 10s max
+
+        // TTS speaks ~2.5 words/second, so calculate max words
+        const maxWords = Math.floor(maxDuration * 2.5);
+
+        setProgress(`Translating segment ${i + 1}/${textSegments.length}...`);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const translateResult = (await fal.subscribe(MODELS.llm, {
+          input: {
+            prompt: `Translate to ${targetLang}. You have EXACTLY ${maxDuration.toFixed(1)} seconds. MAX ${maxWords} words.
+${contextSection}
+RULES:
+- MAX ${maxWords} WORDS (this is critical - audio will be cut if longer)
+- Keep names/brands as-is
+- Natural spoken language
+- Shorter is better
+
+Original: "${segment.text}"
+
+JSON only: {"translation": "...", "language_boost": "${targetLang}"}`,
+            system_prompt: `Dubbing translator. STRICT LIMIT: ${maxWords} words max. Shorter = better. JSON only.`,
+            model: MODELS.llmModel,
+            temperature: 0.1,
+          },
+        })) as any;
+        const translateData = translateResult?.data || translateResult;
+        const rawOutput = (translateData?.output || translateData?.text || "").trim();
+
+        let translated = "";
+        let languageBoost = targetLang;
+
+        try {
+          const parsed = JSON.parse(rawOutput.replace(/```json\n?|\n?```/g, ""));
+          translated = parsed.translation || "";
+          languageBoost = parsed.language_boost || targetLang;
+        } catch {
+          translated = rawOutput.replace(/^["']|["']$/g, "");
+        }
+
+        // Log translation with word count
+        const wordCount = translated.split(/\s+/).filter(w => w.length > 0).length;
+        console.log(`[Translate] Segment ${i}: "${translated}" (${wordCount} words, max was ${maxWords})`);
+
+        if (translated) {
+          translatedSegments.push({
+            originalText: segment.text,
+            translatedText: translated,
+            startTime: segment.startTime,
+            maxDuration,
+            languageBoost,
+          });
+        }
+      }
+
+      if (translatedSegments.length === 0) throw new Error("Failed to translate any segments");
+      setTranslatedText(translatedSegments.map((s) => s.translatedText).join(" "));
       updateStep("translate", "complete");
 
-      // Step 6: Generate dubbed audio with cloned voice, language boost & pronunciation hints
+      // Step 6: Generate TTS for each segment separately with speed estimation
       updateStep("tts", "processing");
-      setProgress("Generating dubbed audio with cloned voice...");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const ttsInput: any = {
-        prompt: translated,
-        voice_setting: {
-          voice_id: clonedVoiceId,
-          speed: 1.0,
-          vol: 1.0,
-          pitch: 0,
-          english_normalization: true,
-        },
-        output_format: "url",
-        language_boost: languageBoost,
-      };
-      // Add pronunciation hints if available
-      if (pronunciationHints.length > 0) {
-        ttsInput.pronunciation_dict = { tone_list: pronunciationHints };
+      const audioSegments: AudioSegment[] = [];
+
+      for (let i = 0; i < translatedSegments.length; i++) {
+        const segment = translatedSegments[i]!;
+        setProgress(`Generating audio ${i + 1}/${translatedSegments.length}...`);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ttsInput: any = {
+          prompt: segment.translatedText,
+          voice_setting: {
+            voice_id: clonedVoiceId,
+            speed: 1.0, // ALWAYS 1.0 - NO SPEED CHANGES
+            vol: 1.0,
+            pitch: 0,
+            english_normalization: true,
+          },
+          output_format: "url",
+          language_boost: segment.languageBoost,
+        };
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ttsResult = (await fal.subscribe(MODELS.tts, {
+          input: ttsInput,
+        })) as any;
+        const ttsData = ttsResult?.data || ttsResult;
+        const audioUrl = ttsData?.audio?.url || ttsData?.audio_url || "";
+
+        if (audioUrl) {
+          audioSegments.push({
+            audioUrl,
+            startTime: segment.startTime, // Position at original timestamp
+            targetDuration: segment.maxDuration, // Used for trimming if audio is too long
+          });
+        }
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const ttsResult = (await fal.subscribe(MODELS.tts, {
-        input: ttsInput,
-      })) as any;
-      const ttsData = ttsResult?.data || ttsResult;
-      const dubbedAudioUrl = ttsData?.audio?.url || ttsData?.audio_url || "";
-      if (!dubbedAudioUrl) throw new Error("Failed to generate dubbed audio");
+
+      if (audioSegments.length === 0) throw new Error("Failed to generate any dubbed audio");
       updateStep("tts", "complete");
 
-      // Step 7: Merge audio with video (browser-side, no lipsync)
+      // Step 7: Merge positioned audio segments, then combine with video using FFmpeg (server-side)
       updateStep("merge", "processing");
-      setProgress("Merging audio with video...");
-      const mergedVideoBlob = await replaceVideoAudio(videoUrl, dubbedAudioUrl, (p) => {
-        setProgress(`Merging audio with video... ${Math.round(p)}%`);
+      setProgress("Merging and time-stretching audio segments...");
+
+      // Get video duration for merge
+      const tempVideo = document.createElement("video");
+      tempVideo.src = videoPreviewUrl;
+      const videoDuration = await new Promise<number>((resolve, reject) => {
+        tempVideo.onloadedmetadata = () => resolve(tempVideo.duration);
+        tempVideo.onerror = () => reject(new Error("Failed to get video duration"));
       });
+
+      // Create merged audio WAV locally (with time-stretching)
+      const mergedAudioBlob = await mergeAudioSegmentsAtTimestamps(
+        audioSegments,
+        videoDuration,
+        (p) => setProgress(`Processing audio... ${Math.round(p)}%`)
+      );
+
+      // Upload merged audio
+      setProgress("Uploading merged audio...");
+      const mergedAudioUrl = await fal.storage.upload(
+        new File([mergedAudioBlob], "dubbed-audio.wav", { type: "audio/wav" })
+      );
+
+      // Use FFmpeg server-side to merge video + audio (no browser power-saving issues)
+      setProgress("Merging audio with video (server-side)...");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ffmpegResult = (await fal.subscribe(MODELS.mergeAudioVideo, {
+        input: {
+          video_url: videoUrl,
+          audio_url: mergedAudioUrl,
+        },
+        logs: true,
+      })) as any;
+      const ffmpegData = ffmpegResult?.data || ffmpegResult;
+      const outputVideoUrl = ffmpegData?.video?.url || ffmpegData?.video_url || "";
+      if (!outputVideoUrl) throw new Error("Failed to merge audio with video");
       updateStep("merge", "complete");
 
-      // Create URL for the merged video
-      const mergedVideoUrl = URL.createObjectURL(mergedVideoBlob);
-      setResultVideoUrl(mergedVideoUrl);
+      setResultVideoUrl(outputVideoUrl);
       setStatus("complete");
       setProgress("");
     } catch (err) {
@@ -267,19 +432,23 @@ Text to translate:
 
   const handleReset = () => {
     if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
-    if (resultVideoUrl) URL.revokeObjectURL(resultVideoUrl);
+    // Note: resultVideoUrl is now a remote fal.ai URL, no need to revoke
     setVideoFile(null);
     setVideoPreviewUrl("");
     resetResults();
     setError(null);
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!resultVideoUrl) return;
+    // Fetch the remote video and download
+    const res = await fetch(resultVideoUrl);
+    const blob = await res.blob();
     const a = document.createElement("a");
-    a.href = resultVideoUrl;
-    a.download = `voice-dubbed-${targetLanguage}-${Date.now()}.webm`;
+    a.href = URL.createObjectURL(blob);
+    a.download = `voice-dubbed-${targetLanguage}-${Date.now()}.mp4`;
     a.click();
+    URL.revokeObjectURL(a.href);
   };
 
   const isProcessing = status === "uploading" || status === "processing";

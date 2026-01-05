@@ -51,7 +51,7 @@ const TABS: TabInfo[] = [
     icon: Languages,
     description: "Translate text between 25+ languages",
     models: [
-      { name: "google/gemini-2.5-flash", purpose: "LLM translation" },
+      { name: "google/gemini-3-flash-preview", purpose: "LLM translation" },
     ],
   },
   {

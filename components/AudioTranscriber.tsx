@@ -6,12 +6,11 @@ import { FalSpinner } from "@/components/ui/fal-spinner";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { AudioPlayer } from "@/components/ui/audio-player";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Mic, Upload, X, Square, Copy, Download, Languages, Clock, FileAudio, AlertCircle } from "lucide-react";
+import { Mic, Upload, X, Square, Copy, Download, Clock, FileAudio, AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES, MODELS, getLanguageByCode, formatDuration } from "@/lib/constants";
 import type { ProcessingStatus, TranscriptSegment } from "@/lib/types";
@@ -34,7 +33,6 @@ export function AudioTranscriber({ hasFalKey }: AudioTranscriberProps) {
 
   // Settings
   const [sourceLanguage, setSourceLanguage] = useState("auto");
-  const [translateToEnglish, setTranslateToEnglish] = useState(false);
 
   // Results
   const [transcriptText, setTranscriptText] = useState<string>("");
@@ -129,28 +127,81 @@ export function AudioTranscriber({ hasFalKey }: AudioTranscriberProps) {
       const audioUrl = await fal.storage.upload(audioFile);
       setStatus("processing");
 
+      // Use ElevenLabs STT for word-level timestamps
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const input: any = {
         audio_url: audioUrl,
-        chunk_level: "segment",
-        task: translateToEnglish ? "translate" : "transcribe",
-        version: "3",
+        tag_audio_events: true,
+        diarize: true,
       };
-      if (sourceLanguage !== "auto") input.language = sourceLanguage;
+      // Add language code if specified (ElevenLabs uses ISO codes like "eng", "tur", etc.)
+      if (sourceLanguage !== "auto") {
+        // Map 2-letter codes to 3-letter codes for ElevenLabs
+        const langMap: Record<string, string> = {
+          en: "eng", es: "spa", it: "ita", fr: "fra", tr: "tur", de: "deu",
+          pt: "por", nl: "nld", ru: "rus", ja: "jpn", ko: "kor", zh: "zho",
+          ar: "ara", hi: "hin", pl: "pol", sv: "swe", no: "nor", da: "dan",
+          fi: "fin", el: "ell", he: "heb", th: "tha", vi: "vie", id: "ind",
+          uk: "ukr", cs: "ces", ro: "ron", hu: "hun",
+        };
+        input.language_code = langMap[sourceLanguage] || sourceLanguage;
+      }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await fal.subscribe(MODELS.whisper, { input, logs: true }) as any;
+      const result = await fal.subscribe(MODELS.elevenlabsSTT, { input, logs: true }) as any;
       const data = result?.data || result;
 
       setTranscriptText(data?.text || "");
-      if (data?.chunks?.length > 0) {
-        setSegments(data.chunks.map((c: { timestamp: number[]; text: string }) => ({
-          start: c.timestamp[0],
-          end: c.timestamp[1],
-          text: c.text,
-        })));
+
+      // Parse words into segments for display
+      if (data?.words?.length > 0) {
+        // Group words into segments (similar to chunks)
+        interface WordData {
+          text: string;
+          start: number;
+          end: number;
+          type: string;
+          speaker_id?: string;
+        }
+        const words = data.words as WordData[];
+        const parsedSegments: TranscriptSegment[] = [];
+        let currentSeg: { words: string[]; start: number; end: number; speaker?: string } | null = null;
+        const GAP_THRESHOLD = 1.0; // Group words with < 1s gap
+
+        for (const word of words) {
+          if (word.type !== "word") continue;
+
+          if (!currentSeg) {
+            currentSeg = { words: [word.text], start: word.start, end: word.end, speaker: word.speaker_id };
+          } else {
+            const gap = word.start - currentSeg.end;
+            if (gap > GAP_THRESHOLD || word.speaker_id !== currentSeg.speaker) {
+              // Save and start new segment
+              parsedSegments.push({
+                start: currentSeg.start,
+                end: currentSeg.end,
+                text: currentSeg.words.join(" "),
+                speaker: currentSeg.speaker,
+              });
+              currentSeg = { words: [word.text], start: word.start, end: word.end, speaker: word.speaker_id };
+            } else {
+              currentSeg.words.push(word.text);
+              currentSeg.end = word.end;
+            }
+          }
+        }
+        if (currentSeg && currentSeg.words.length > 0) {
+          parsedSegments.push({
+            start: currentSeg.start,
+            end: currentSeg.end,
+            text: currentSeg.words.join(" "),
+            speaker: currentSeg.speaker,
+          });
+        }
+        setSegments(parsedSegments);
       }
-      if (data?.inferred_languages?.[0]) setDetectedLanguage(data.inferred_languages[0]);
+
+      if (data?.language_code) setDetectedLanguage(data.language_code);
       setProcessingTime((Date.now() - startTime) / 1000);
       setStatus("complete");
     } catch (err) {
@@ -258,13 +309,7 @@ export function AudioTranscriber({ hasFalKey }: AudioTranscriberProps) {
               </Select>
             </div>
 
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Languages className="w-4 h-4 text-white/40" />
-                <Label className="text-sm text-white/60">Translate to English</Label>
-              </div>
-              <Switch checked={translateToEnglish} onCheckedChange={setTranslateToEnglish} />
-            </div>
+            {/* Note: ElevenLabs STT doesn't support translation - use separate translation step if needed */}
           </div>
 
           {/* Transcribe Button */}

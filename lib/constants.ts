@@ -184,7 +184,7 @@ export const SUBTITLE_PRESETS = [
 export const MODELS = {
   // LLM
   llm: "openrouter/router",
-  llmModel: "google/gemini-2.5-flash",
+  llmModel: "google/gemini-3-flash-preview",
 
   // Speech-to-Text
   whisper: "fal-ai/whisper",
@@ -198,6 +198,7 @@ export const MODELS = {
   // Video
   autoSubtitle: "fal-ai/workflow-utilities/auto-subtitle",
   lipsync: "fal-ai/sync-lipsync/v2",
+  mergeAudioVideo: "fal-ai/ffmpeg-api/merge-audio-video",
 
   // Image
   imageEdit: "fal-ai/nano-banana-pro/edit",
